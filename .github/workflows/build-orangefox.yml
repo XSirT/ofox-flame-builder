@@ -1,0 +1,130 @@
+name: Build OrangeFox for flame
+
+on:
+  workflow_dispatch:
+    inputs:
+      fox_branch:
+        description: "OrangeFox source branch (14.1 = proven, 16.0 = newest)"
+        type: choice
+        default: "14.1"
+        options: ["14.1", "16.0"]
+      tree_url:
+        description: "Recovery device tree"
+        default: "https://github.com/atlas4381/twrp_device_xiaomi_flame"
+      tree_branch:
+        description: "Device tree branch"
+        default: "main"
+      maintainer:
+        description: "Maintainer name shown in recovery"
+        default: "SIY"
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 355
+    env:
+      FOX_BRANCH: ${{ inputs.fox_branch }}
+      TREE_URL: ${{ inputs.tree_url }}
+      TREE_BRANCH: ${{ inputs.tree_branch }}
+      OF_MAINTAINER: ${{ inputs.maintainer }}
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache /usr/local/share/boost /usr/share/swift \
+                      /usr/local/.ghcup /usr/local/share/powershell
+          sudo docker image prune --all --force || true
+          sudo apt-get clean
+          df -h / /mnt || true
+
+      - name: Pick the work directory with the most space
+        run: |
+          root_free=$(df --output=avail -k / | tail -1)
+          mnt_free=$(df --output=avail -k /mnt 2>/dev/null | tail -1 || echo 0)
+          if [ "${mnt_free:-0}" -gt "$root_free" ]; then
+            sudo mkdir -p /mnt/work && sudo chown "$USER":"$USER" /mnt/work
+            echo "WORK=/mnt/work" >> "$GITHUB_ENV"
+          else
+            mkdir -p "$HOME/work_fox"
+            echo "WORK=$HOME/work_fox" >> "$GITHUB_ENV"
+          fi
+
+      - name: Add swap
+        run: |
+          sudo swapoff -a || true
+          sudo fallocate -l 12G "$WORK/swapfile"
+          sudo chmod 600 "$WORK/swapfile"
+          sudo mkswap "$WORK/swapfile"
+          sudo swapon "$WORK/swapfile"
+          free -h
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            git gnupg flex bison build-essential zip unzip curl zlib1g-dev \
+            libc6-dev-i386 lib32z1-dev libx11-dev x11proto-core-dev \
+            libgl1-mesa-dev libxml2-utils xsltproc fontconfig rsync bc ccache \
+            lz4 zstd cpio libncurses5 libssl-dev python3 python-is-python3 \
+            openjdk-17-jdk aria2 patch patchelf
+          mkdir -p "$HOME/bin"
+          curl -sSL https://storage.googleapis.com/git-repo-downloads/repo -o "$HOME/bin/repo"
+          chmod +x "$HOME/bin/repo"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          git config --global user.name "fox-builder"
+          git config --global user.email "fox-builder@users.noreply.github.com"
+          git config --global color.ui false
+
+      - name: Sync OrangeFox sources
+        run: |
+          cd "$WORK"
+          git clone --depth 1 https://gitlab.com/OrangeFox/sync.git
+          cd sync
+          ./orangefox_sync.sh --branch "$FOX_BRANCH" --path "$WORK/fox"
+          df -h "$WORK"
+
+      - name: Add the flame device tree
+        run: |
+          cd "$WORK/fox"
+          git clone --depth 1 -b "$TREE_BRANCH" "$TREE_URL" device/xiaomi/flame
+          cd device/xiaomi/flame
+          # The upstream tree is set up for the China model: switch the UI to English
+          sed -i 's/^\(TW_DEFAULT_LANGUAGE[[:space:]]*:=\).*/\1 en/' BoardConfig.mk
+          sed -i 's/^\(TW_DEVICE_VERSION[[:space:]]*:=\).*/\1 flame/' BoardConfig.mk
+          grep -n "TW_DEFAULT_LANGUAGE\|TW_DEVICE_VERSION" BoardConfig.mk
+          git log -1 --format='device tree commit: %H %ad'
+
+      - name: Build
+        run: |
+          source "$GITHUB_WORKSPACE/fox_vars.sh"
+          cd "$WORK/fox"
+          set +e
+          source build/envsetup.sh
+          ok=0
+          for combo in twrp_flame-ap2a-eng twrp_flame-bp2a-eng twrp_flame-bp1a-eng twrp_flame-eng; do
+            echo "== trying lunch $combo"
+            if lunch "$combo"; then ok=1; break; fi
+          done
+          if [ "$ok" != 1 ]; then echo "No lunch combo worked"; exit 1; fi
+          mka adbd recoveryimage -j"$(nproc)"
+          rc=$?
+          ls -la out/target/product/flame/ 2>/dev/null | head -60
+          exit $rc
+
+      - name: Collect output
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/output"
+          cd "$WORK/fox/out/target/product/flame"
+          cp -v OrangeFox*.zip OrangeFox*.img recovery.img "$GITHUB_WORKSPACE/output/" 2>/dev/null || true
+          ls -la "$GITHUB_WORKSPACE/output"
+          test -n "$(ls -A "$GITHUB_WORKSPACE/output")"
+
+      - name: Upload recovery
+        uses: actions/upload-artifact@v4
+        with:
+          name: OrangeFox-flame-${{ inputs.fox_branch }}
+          path: output/*
+          if-no-files-found: error
