@@ -17,6 +17,11 @@ on:
       maintainer:
         description: "Maintainer name shown in recovery"
         default: "SIY"
+      decryption:
+        description: "Data decryption (off = boots without unlocking internal storage)"
+        type: choice
+        default: "on"
+        options: ["on", "off"]
 
 jobs:
   build:
@@ -27,6 +32,7 @@ jobs:
       TREE_URL: ${{ inputs.tree_url }}
       TREE_BRANCH: ${{ inputs.tree_branch }}
       OF_MAINTAINER: ${{ inputs.maintainer }}
+      DECRYPTION: ${{ inputs.decryption }}
     steps:
       - name: Checkout this repo
         uses: actions/checkout@v4
@@ -95,6 +101,14 @@ jobs:
           sed -i 's/^\(TW_DEFAULT_LANGUAGE[[:space:]]*:=\).*/\1 en/' BoardConfig.mk
           sed -i 's/^\(TW_DEVICE_VERSION[[:space:]]*:=\).*/\1 flame/' BoardConfig.mk
           grep -n "TW_DEFAULT_LANGUAGE\|TW_DEVICE_VERSION" BoardConfig.mk
+          if [ "$DECRYPTION" = "off" ]; then
+            # Decryption hangs on the splash screen with some ROMs: build without it
+            for v in TW_INCLUDE_CRYPTO TW_INCLUDE_CRYPTO_FBE TW_INCLUDE_FBE_METADATA_DECRYPT BOARD_USES_QCOM_FBE_DECRYPTION; do
+              sed -i "s/^\($v[[:space:]]*:=\).*/\1 false/" BoardConfig.mk
+            done
+            sed -i '/^TW_USE_FSCRYPT_POLICY/d' BoardConfig.mk
+            grep -n "CRYPT\|FBE" BoardConfig.mk || true
+          fi
           git log -1 --format='device tree commit: %H %ad'
 
       - name: Build
@@ -125,6 +139,6 @@ jobs:
       - name: Upload recovery
         uses: actions/upload-artifact@v4
         with:
-          name: OrangeFox-flame-${{ inputs.fox_branch }}
+          name: OrangeFox-flame-${{ inputs.fox_branch }}-decrypt-${{ inputs.decryption }}
           path: output/*
           if-no-files-found: error
